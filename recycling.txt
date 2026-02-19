@@ -1,0 +1,907 @@
+#!/bin/bash
+
+# Fixed durations for testing
+
+exec > /home/student/script_running_log 2>&1
+
+sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confold" install -y openssh-server
+
+IDLE_TIMEOUT=2        # 2 minute idle time max (in minutes)
+
+ATTACKER_MAX=20        # 20 minutes max per attacker session (in minutes)
+
+# Array of external IP addresses and container IPs
+
+EXTERNAL_IPS=("128.8.238.46" "128.8.238.177" "128.8.238.103")
+
+# Directory path to log files for MITM activity
+
+LOG_DIR="/home/student/MITM/logs"
+
+
+
+# Array of container names for random assignment
+
+CONTAINERS=("baseConfig1" "baseConfig2" "baseConfig3" "baseConfig4" "baseConfig5")
+
+# Function to select a random container base
+
+select_random_container() {
+
+    local index=$((RANDOM % ${#CONTAINERS[@]}))
+
+    local selected_container="${CONTAINERS[$index]}"
+
+    echo "$selected_container"
+
+}
+
+# Function to dynamically get the container's IP after restoring the container
+
+get_container_ip() {
+
+    local container=$1
+
+    local container_ip=""
+
+    # Wait for the container to get an IP address
+
+    while true; do
+
+        container_ip=$(sudo lxc-info -n "$container" | grep "IP" | awk '{print $2}')
+
+        if [ -n "$container_ip" ]; then
+
+            break
+
+        fi
+
+        sleep 2  # Wait 2 seconds before checking again
+
+    done
+
+    echo "$container_ip"
+
+}
+
+# Function to generate a random port that is available
+
+generate_random_port() {
+
+    while true; do
+
+        random_port=$(shuf -i 2000-65000 -n 1)
+
+        if ! ss -tuln | grep ":$random_port" >/dev/null; then
+
+            echo "$random_port"
+
+            break
+
+        fi
+
+    done
+
+}
+
+# Function to check for an SSH connection (attacker)
+
+wait_for_attacker() {
+
+    local port=$1
+
+    local external_ip=$2
+
+    local container=$3
+
+    local last_timestamp=""
+
+
+
+    echo "Waiting for an attacker to connect on IP $external_ip port $port..."
+
+
+
+    # Get the last known connection timestamp before the loop starts (if any)
+
+    last_timestamp=$(grep 'Attacker connected:' "${LOG_DIR}"/mitm_output_"${container}".log | tail -n 1 | awk '{print $1, $2}')
+
+
+
+    # Loop until a new attacker connects
+
+    while true; do
+
+        # Extract the last log entry's timestamp and IP address
+
+        CURRENT_LOG=$(grep 'Attacker connected:' "${LOG_DIR}"/mitm_output_"${container}".log | tail -n 1)
+
+        CURRENT_TIMESTAMP=$(echo "$CURRENT_LOG" | awk '{print $1, $2}')
+
+        CURRENT_IP=$(echo "$CURRENT_LOG" | awk '{print $8}')
+
+
+
+        # Check if a new connection is detected by comparing timestamps and validating the IP address
+
+        if [ -n "$CURRENT_TIMESTAMP" ] && [ "$CURRENT_TIMESTAMP" != "$last_timestamp" ]; then
+
+            if [ -n "$CURRENT_IP" ] && [[ $CURRENT_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+
+                echo "New attacker connected from IP: $CURRENT_IP at $CURRENT_TIMESTAMP"
+
+             echo "$CURRENT_IP"  # Return the IP
+
+                break  # Exit the loop once a new, valid connection is detected
+
+            fi
+
+        fi
+
+
+
+        sleep 1  # Wait 1 second before checking again
+
+    done
+
+
+
+    # Call the function to set up the filter rules for the new attacker
+
+    setup_filter_rules "$port" "$CURRENT_IP" "$external_ip"
+
+}
+
+# Function to set up NAT rules for redirecting traffic from external IP to container IP on port 22 (SSH) and a random port (MITM)
+
+setup_nat_rules() {
+
+    local external_ip=$1
+
+    local container_ip=$2
+
+    local random_port=$3
+
+    # Wait indefinitely until container_ip is available
+
+    while [ -z "$container_ip" ]; do
+
+        echo "Waiting for container $container to get an IP address..."
+
+        sleep 5
+
+        container_ip=$(sudo lxc-info -n "$container" | grep "IP" | awk '{print $2}')
+
+    done
+
+    echo "Setting up NAT rules: $external_ip to $container_ip (SSH on port 22, MITM on random port $random_port)"
+
+    sudo ip link set dev eth3 up
+
+    sudo sysctl -w net.ipv4.conf.all.route_localnet=1
+
+    # PREROUTING rule to forward external traffic to the container's SSH port (always port 22)
+
+    sudo iptables --table nat --insert PREROUTING --source 0.0.0.0/0 --destination "$external_ip" --jump DNAT --to-destination "$container_ip"
+
+if [ $? -ne 0 ]; then
+
+    echo "Error: Failed to add PREROUTING rule for SSH traffic from $external_ip to $container_ip." >> "${LOG_DIR}/nat_errors.log"
+
+    return 1
+
+fi
+
+    # POSTROUTING rule to ensure container's outgoing traffic uses external IP as the source (NAT)
+
+    sudo iptables --table nat --insert POSTROUTING --source "$container_ip" --destination 0.0.0.0/0 --jump SNAT --to-source "$external_ip"
+
+if [ $? -ne 0 ]; then
+
+    echo "Error: Failed to add POSTROUTING rule for outgoing traffic from $container_ip to $external_ip." >> "${LOG_DIR}/nat_errors.log"
+
+    return 1
+
+fi
+
+    # PREROUTING rule for MITM traffic
+
+     sudo iptables --table nat --insert PREROUTING --source 0.0.0.0/0 --destination "$external_ip" --protocol tcp --dport 22 --jump DNAT --to-destination 10.0.3.1:"$random_port"
+
+if [ $? -ne 0 ]; then
+
+    echo "Error: Failed to add PREROUTING rule for MITM on port 22 from $external_ip to random port $random_port.">> "${LOG_DIR}/nat_errors.log"
+
+    return 1
+
+fi
+
+}
+
+# Function to set up filter rules for restricting communication to the current attacker's IP
+
+setup_filter_rules() {
+
+    local random_port=$1
+
+    local CURRENT_IP=$2
+
+    local external_ip=$3
+
+    echo "Setting up filter rules for attacker IP:$CURRENT_IP on external ip $external_ip on port $random_port"
+
+    # Drop all other connections to this port (filter rule)
+
+    sudo iptables --insert INPUT -d 10.0.3.1 -p tcp --dport "$random_port" --jump DROP
+
+    # Allow only the current IP to communicate with the honeypot (filter rule)
+
+    sudo iptables --insert INPUT -s "$CURRENT_IP" -d 10.0.3.1 -p tcp --dport "$random_port" --jump ACCEPT
+
+    echo "Filter rules applied: Only "$CURRENT_IP" can interact with the honeypot on external ip "$external_ip" port "$random_port.""
+
+}
+
+# Function to stop and destroy a container, regardless of its state
+
+stop_container() {
+
+    local container=$1
+
+    # Check if the container is running
+
+    if sudo lxc-info -n "$container" | grep "RUNNING"; then
+
+        echo "Container $container is running. Stopping it now..."
+
+        container_ip=`sudo lxc-info -iH -n $container`
+
+        echo $container_ip
+        rm /home/student/foreverId
+        rm /home/student/portnum
+        cat /home/student/foreverId
+        sudo forever list | grep $container_ip | cut -d ' ' -f 5  | tr -d '[' | tr -d ']' > /home/student/foreverId
+        sudo forever list | grep $container_ip | cut -d 'p' -f 2 | cut -d' ' -f 2 > /home/student/portnum
+
+        portNum=`cat /home/student/portnum`
+        foreverId=`cat /home/student/foreverId`
+        rm /home/student/foreverId
+        rm /home/student/portnum
+
+        sudo forever stop $foreverId
+
+        # Stop the container if it's running
+
+        sudo lxc-stop -n "$container" 2>> "${LOG_DIR}/lxc_errors.log"
+
+        if [ $? -ne 0 ]; then
+
+            echo "Error: Failed to stop container $container." >> "${LOG_DIR}/lxc_errors.log"
+
+            return 1
+
+        fi
+
+    else
+
+        echo "Container $container is not running."
+
+    fi
+
+    # Destroy the container regardless of its state
+
+    echo "Destroying container $container..."
+
+    sudo lxc-destroy -n "$container" 2>> "${LOG_DIR}/lxc_errors.log"
+
+    if [ $? -ne 0 ]; then
+
+        echo "Error: Failed to destroy container $container." >> "${LOG_DIR}/lxc_errors.log"
+
+        return 1
+
+    fi
+
+    echo "Container $container successfully stopped and destroyed."
+
+}
+
+
+
+# Function to remove specific NAT and filter rules for the current attacker
+
+remove_nat_and_filter_rules() {
+
+    local external_ip=$1
+
+    local container_ip=$2
+
+    local random_port=$3
+
+    local current_ip=$4
+
+
+
+    echo "Removing specific NAT and filter rules for IP $external_ip to container IP $container_ip on port $random_port..."
+
+
+    # Remove the specific PREROUTING rule for NAT (external to container IP)
+
+    sudo iptables -t nat -D PREROUTING -s 0.0.0.0/0 -d "$external_ip" -j DNAT --to-destination "$container_ip" 2>> "${LOG_DIR}/nat_errors.log"
+
+    if [ $? -ne 0 ]; then
+
+        echo "Error: Failed to delete specific NAT PREROUTING rule for $external_ip to $container_ip." >> "${LOG_DIR}/nat_errors.log"
+
+    fi
+
+
+
+    # Remove the specific POSTROUTING rule for NAT (container to external IP)
+
+    sudo iptables -t nat -D POSTROUTING -s "$container_ip" -d 0.0.0.0/0 -j SNAT --to-source "$external_ip" 2>> "${LOG_DIR}/nat_errors.log"
+
+    if [ $? -ne 0 ]; then
+
+        echo "Error: Failed to delete specific NAT POSTROUTING rule for $container_ip to $external_ip." >> "${LOG_DIR}/nat_errors.log"
+
+    fi
+
+
+
+    # Remove the specific PREROUTING rule for the MITM (if any) to random port
+
+    sudo iptables -t nat -D PREROUTING -s 0.0.0.0/0 -d "$external_ip" -p tcp --dport 22 -j DNAT --to-destination 10.0.3.1:"$random_port" 2>> "${LOG_DIR}/nat_errors.log"
+
+    if [ $? -ne 0 ]; then
+
+        echo "Error: Failed to delete specific NAT PREROUTING rule for MITM on port $random_port from $external_ip." >> "${LOG_DIR}/nat_errors.log"
+
+    fi
+
+
+
+    # Remove the specific INPUT filter rule allowing only the current attacker's IP
+
+    sudo iptables  -D INPUT -d 10.0.3.1 -p tcp --dport "$random_port" --jump DROP 2>> "${LOG_DIR}/nat_errors.log"
+
+    if [ $? -ne 0 ]; then
+
+        echo "Error: Failed to delete specific INPUT filter rule for attacker IP $current_ip on port $random_port." >> "${LOG_DIR}/nat_errors.log"
+
+    fi
+
+
+
+    # Remove the general drop rule for other connections on this port
+
+     sudo iptables --insert INPUT -s "$CURRENT_IP" -d 10.0.3.1 -p tcp --dport "$random_port" --jump ACCEPT 2>> "${LOG_DIR}/nat_errors.log"
+
+    if [ $? -ne 0 ]; then
+
+        echo "Error: Failed to delete general INPUT drop rule on port $random_port." >> "${LOG_DIR}/nat_errors.log"
+
+    fi
+
+
+
+    echo "Specific NAT and filter rules removed for the attacker session."
+
+}
+
+
+
+
+
+# Function to stop the MITM process based on container and IP and port
+
+stop_mitm() {
+
+    local container=$1
+
+    local external_ip=$2
+
+    local random_port=$3
+
+
+
+    # Find the MITM process for this container based on IP and port
+
+    mitm_pid=$(ps aux | grep "mitm.js" | grep "$container" | grep "$external_ip" | grep "$random_port" | grep -v grep | awk '{print $2}')
+
+
+
+    if [ -n "$mitm_pid" ]; then
+
+        # Kill the MITM process
+
+        kill "$mitm_pid"
+
+        if [ $? -eq 0 ]; then
+
+            echo "Stopped MITM process for container $container with PID: $mitm_pid"
+
+        else
+
+            echo "Error: Failed to stop MITM process for container $container."
+
+        fi
+
+    else
+
+        echo "MITM process for container $container, IP $external_ip, and port $random_port not found."
+
+    fi
+
+}
+
+
+
+
+
+# Function to start MITM using container IP and random port
+
+start_mitm() {
+
+    local container=$1
+
+    local container_ip=$2
+
+    local random_port=$3
+
+    local external_ip=$4
+
+    # Wait indefinitely until container_ip is available
+
+    while [ -z "$container_ip" ]; do
+
+        echo "Waiting for container $container to get an IP address..."
+
+        sleep 5
+
+        container_ip=$(sudo lxc-info -n "$container" | grep "IP" | awk '{print $2}')
+
+    done
+
+    echo "Starting MITM for external ip $external_ip for $container (Container IP: $container_ip) on random port $random_port"
+
+    # Start MITM with forever to ensure it runs continuously, append logs (-a option)
+
+    sudo forever -a -l ${LOG_DIR}/mitm_output_${container}.log start /home/student/MITM/mitm.js -n $container -i $container_ip -p $random_port --auto-access --auto-access-fixed 1 --debug --container-mount-path-suffix rootfs/ --mitm-ip 10.0.3.1 &
+
+if [ $? -ne 0 ]; then
+
+    echo "Error: Failed to start MITM for container $container." >> "${LOG_DIR}/mitm_errors.log"
+
+    return 1
+
+fi
+
+# Get the process ID (PID) of the MITM process
+
+MITM_PID=$!
+
+# Save the PID to a file for future reference (e.g., stopping later)
+
+echo $MITM_PID > "/home/student/pidfiles/${container}_${external_ip}.pid"
+
+}
+
+# Function to restore from the most recent snapshot and wait until the snapshot is cloned and ready
+
+restore_from_snapshot() {
+
+    local original_container=$1
+
+    local new_container_name=$2
+
+    local captcha_script=""
+
+    echo "Restoring $original_container as $new_container_name from the latest snapshot..."
+
+
+
+    # Stop and destroy the original container if it's running
+
+    stop_container "$new_container_name"
+
+    # Clone the container from the snapshot with a new name
+
+    sudo lxc-copy -n "$original_container" -N "$new_container_name"
+
+# Wait until the container is created and running
+
+    wait_until_container_is_created "$new_container_name"
+
+    sudo lxc-start -n "$new_container_name" 2>> "${LOG_DIR}/lxc_errors.log"
+
+    wait_until_container_is_running "$new_container_name"
+
+    echo "$new_container_name is now running."
+
+
+    sudo lxc-attach -n "$new_container_name" -- sudo apt-get install ssh
+
+    # Ensure SSH service is running and keys are generated
+
+    sudo lxc-attach -n "$new_container_name" -- service ssh restart
+
+    return 0
+
+}
+
+# Function to wait until the container is created from the snapshot
+
+wait_until_container_is_created() {
+
+    local container=$1
+
+    echo "Waiting for container $container to be created..."
+
+    while true; do
+
+        # Check if the container exists
+
+        container_exists=$(sudo lxc-info -n "$container" | grep "Name")
+
+        if [ -n "$container_exists" ]; then
+
+            echo "Container $container has been created from the snapshot."
+
+            break
+
+        fi
+
+        sleep 2  # Wait 2 seconds before checking again
+
+    done
+
+}
+
+# Function to wait until the container is running
+
+wait_until_container_is_running() {
+
+    local container=$1
+
+    echo "Waiting for container $container to start..."
+
+    while true; do
+
+        # Check if the container is running
+
+        container_status=$(sudo lxc-info -n "$container" | grep "State" | awk '{print $2}')
+
+        if [ "$container_status" == "RUNNING" ]; then
+
+            echo "Container $container is now running."
+
+            break
+
+        fi
+
+        sleep 2  # Wait 2 seconds before checking again
+
+    done
+
+}
+
+
+
+# Function to handle the setup for each IP
+
+setup_for_ip() {
+
+    local external_ip=$1
+
+    # Select a random container base (easy, moderate, hard, etc.)
+
+    local selected_container=$(select_random_container "$external_ip")
+
+    # Generate the container name dynamically based on the external IP
+
+    formatted_ip="${external_ip//./_}"
+
+    new_container="${selected_container}_${formatted_ip}"
+
+    # Restore the container from the snapshot with a new name based on the external IP
+
+    restore_from_snapshot "$selected_container" "$new_container"
+
+    # Dynamically get the container's IP after restoring the container
+
+    container_ip=$(get_container_ip "$new_container")
+
+    # Generate a random port for MITM
+
+    random_port=$(generate_random_port)
+
+    # Set up NAT rules for external IP and the container IP
+
+    setup_nat_rules "$external_ip" "$container_ip" "$random_port"
+
+    sleep 5
+
+    # Start MITM
+
+    start_mitm "$new_container" "$container_ip" "$random_port" "$external_ip"
+
+    sleep 5
+
+    # Wait for an attacker to connect on port 22 (SSH)
+
+    CURRENT_IP=$(wait_for_attacker "$random_port" "$external_ip" "$new_container" | tee -a /home/student/script_running_log)
+
+    log_file="${LOG_DIR}/mitm_output_${new_container}.log"
+
+    sleep 5
+
+    # Monitor and recycle the container
+
+    monitor_log_and_recycle "$external_ip" "$new_container" "$container_ip" "$random_port" "$log_file" "$CURRENT_IP"
+
+}
+
+
+
+monitor_log_and_recycle() {
+
+    local external_ip=$1
+
+    local container=$2
+
+    local container_ip=$3
+
+    local random_port=$4
+
+    local log_file=$5
+
+    local CURRENT_IP=$6
+
+    local last_timestamp=""
+
+    local last_closed_timestamp=""
+
+
+
+    echo "Monitoring log for IP $external_ip in container $container..."
+
+
+
+    # Get the last known connection timestamp before the loop starts (if any)
+
+    last_timestamp=$(grep 'Attacker authenticated and is inside container' "$log_file" | tail -n 1 | awk '{print $1, $2}')
+
+    # Get the last known "closed connection" timestamp before the loop starts
+
+last_closed_timestamp=$(grep 'closed connection' "$log_file" | tail -n 1 | awk '{print $1, $2}')
+
+
+
+
+
+    # Variables for tracking session duration
+
+    local session_duration=0
+
+    local idle_timeout=0
+
+    local max_idle_timeout=$((IDLE_TIMEOUT * 60))
+
+    local max_session_duration=$((ATTACKER_MAX * 60))
+
+
+
+    # Loop to monitor log and recycle container
+
+    while true; do
+
+        # Extract the last log entry's timestamp and IP address
+
+        CURRENT_LOG=$(grep 'Attacker authenticated and is inside container' "$log_file" | tail -n 1)
+
+        CURRENT_TIMESTAMP=$(echo "$CURRENT_LOG" | awk '{print $1, $2}')
+
+        CURRENT_IP=$(echo "$CURRENT_LOG" | awk '{print $8}')
+
+
+
+        # Check if a new authenticated session is detected by comparing timestamps
+
+        if [ -n "$CURRENT_TIMESTAMP" ] && [ "$CURRENT_TIMESTAMP" != "$last_timestamp" ]; then
+
+            if [ -n "$CURRENT_IP" ] && [[ $CURRENT_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+
+                echo "New session detected for IP: $CURRENT_IP at $CURRENT_TIMESTAMP"
+
+                echo "Monitoring session for attacker from IP: $CURRENT_IP"
+
+                last_timestamp="$CURRENT_TIMESTAMP"  # Update the timestamp to the current one
+
+                # Reset session duration and idle_timeout for the new session
+
+                session_duration=0
+
+                idle_timeout=0
+
+            fi
+
+        else
+
+            # If timestamp hasn't changed, increment idle_timeout (indicating inactivity)
+
+            idle_timeout=$((idle_timeout + 1))
+
+        fi
+
+
+
+        # Check if the attacker closed the connection
+
+        sleep 2
+
+        closed_log_entry=$(grep "closed connection" "$log_file" | tail -n 1)
+
+        closed_timestamp=$(echo "$closed_log_entry" | awk '{print $1, $2}')
+
+
+
+        # Only process if the timestamp is newer than the last processed one,
+
+        # is after the login timestamp, and session duration is greater than 0
+
+        if [ -n "$closed_timestamp" ]; then
+
+#           [ "$closed_timestamp" != "$last_closed_timestamp" ] &&
+
+#           [ "$closed_timestamp" \> "$last_timestamp" ] &&
+
+#           [ "$session_duration" -gt 0 ]; then
+
+
+
+            echo "Session closed for IP: $external_ip at $closed_timestamp"
+
+            last_closed_timestamp="$closed_timestamp"  # Update the last processed timestamp
+
+             echo "No active session found for $external_ip, recycling container..."
+
+             remove_nat_and_filter_rules "$external_ip" "$container_ip" "$random_port" "$CURRENT_IP"
+
+             stop_mitm "$container_ip" "$external_ip" "$random_port"
+
+             echo "iptables rules and mitm reset, ready for the next connection."
+
+             stop_container "$container"
+
+             echo "Container destroyed"
+
+             return 0
+
+        fi
+
+
+
+        # Increment the session duration if the attacker is connected
+
+        if [ "$session_duration" -ge 0 ]; then
+
+            session_duration=$((session_duration + 1))
+
+        fi
+
+
+
+        # Handle idle timeout or session expiration logic
+
+        if [[ "$idle_timeout" -ge "$max_idle_timeout" || "$session_duration" -ge "$max_session_duration" ]]; then
+
+            echo "Recycling container $container due to inactivity or session duration of $session_duration seconds on IP $external_ip..."
+
+            remove_nat_and_filter_rules "$external_ip" "$container_ip" "$random_port" "$CURRENT_IP"
+
+            stop_mitm "$container_ip" "$external_ip" "$random_port"
+
+            echo "iptables rules and MITM reset, ready for the next connection."
+
+            stop_container "$container"
+
+            echo "Container stopped and destroyed"
+
+
+
+            return 0
+
+        fi
+
+
+
+        # Sleep for 1 second before checking again
+
+        sleep 1
+
+    done
+
+}
+
+
+
+# Ensure background processes are cleaned up on script exit
+
+trap "kill 0" EXIT
+
+# External IPs are fixed
+
+external_ip_1="128.8.238.46"
+
+external_ip_2="128.8.238.177"
+
+external_ip_3="128.8.238.103"
+
+#external_ip_4="128.8.238.95"
+
+# Set up for external IP 1
+
+#(
+
+#    while true; do
+
+        # Select and set up container randomly for external IP 1
+
+#        setup_for_ip "$external_ip_1"
+
+#    done
+
+#) &  # Run in the background
+
+# Set up for external IP 2
+
+(
+
+     while true; do
+
+        # Select and set up container randomly for external IP 2
+
+        setup_for_ip "$external_ip_2"
+
+    done
+
+
+
+) &  # Run in the background
+
+# Set up for external IP 3
+
+(
+
+     while true; do
+
+        # Select and set up container randomly for external IP 3
+
+        setup_for_ip "$external_ip_3"
+
+    done
+
+) &  # Run in the background
+
+# Set up for external IP 4
+
+#(
+
+ #    while true; do
+
+        # Select and set up container randomly for external IP 4
+
+  #      setup_for_ip "$external_ip_4"
+
+   # done
+
+#
+
+#) &  # Run in the background
+
+# Wait for all background processes to finish
+
+wait
+
+exit 0
