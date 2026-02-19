@@ -1,0 +1,139 @@
+/* Whole body uses a custom font-family */
+body {
+  margin: 0;
+  font-family: "Trebuchet MS", Arial, sans-serif;
+  background: #ffffff;
+  color: #000000;
+}
+
+/* Header + Footer share the same styling (same class) */
+.site-bar {
+  background: #111827; /* different color than rest of page */
+  color: #ffffff;
+  text-align: center; /* centered text requirement */
+  padding: 18px 12px; /* padding requirement */
+  margin: 0; /* margin requirement */
+}
+
+/* Header H1 requirement */
+.site-bar h1 {
+  margin: 0 0 10px 0;
+  font-size: 2rem;
+}
+
+/* Nav: 3 elements, horizontal, no bullets */
+.nav-list {
+  list-style: none; /* no bullet points */
+  padding: 0;
+  margin: 0;
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+}
+
+.nav-list a {
+  display: inline-block;
+  color: #ffffff;
+  text-decoration: none;
+  padding: 8px 12px;
+  border-radius: 8px;
+  transition: background 0.2s ease;
+}
+
+/* Nav hover state */
+.nav-list a:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* Layout: main content + sidebar on one line */
+.page {
+  max-width: 980px;
+  margin: 22px auto;
+  padding: 0 14px;
+
+  display: flex; /* keeps them on one line */
+  gap: 16px;
+  align-items: flex-start;
+}
+
+/* Main Content uses percentage width */
+.main-content {
+  width: 70%;
+  background: #ffffff;
+  padding: 18px; /* margin + padding requirement */
+  margin: 0;
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+}
+
+/* Sidebar uses percentage width + different color */
+.sidebar {
+  width: 30%;
+  background: #6e96d2; /* different from rest of page */
+  padding: 18px; /* margin + padding requirement */
+  margin: 0;
+  border-radius: 12px;
+  transition: background 0.2s ease;
+}
+
+/* Sidebar hover changes background color */
+.sidebar:hover {
+  background: #a3b2d1;
+}
+
+/* Form styling */
+.rps-form {
+  margin-top: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.form-row {
+  display: grid;
+  gap: 6px;
+}
+
+label {
+  font-weight: 700;
+}
+
+input[type="text"] {
+  width: 220px; /* base width */
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  transition: width 0.25s ease; /* smooth expand/shrink */
+}
+
+/* Focus: width increases; unfocus returns */
+input[type="text"]:focus {
+  width: 320px;
+  outline: none;
+  border-color: #2563eb;
+}
+
+select {
+  width: 240px;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+button {
+  width: fit-content;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 10px;
+  background: #2563eb;
+  color: white;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(0.95);
+}
+
+.site-bar p {
+  margin: 0;
+}

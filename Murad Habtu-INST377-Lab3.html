@@ -1,0 +1,75 @@
+<html>
+  <head>
+    <title>INST377 Lab3 - Rock Paper Scissors</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="site-bar">
+      <h1>Rock Paper Scissors</h1>
+
+      <nav class="nav">
+        <ul class="nav-list">
+          <li>
+            <a
+              href="https://en.wikipedia.org/wiki/Rock_paper_scissors"
+              target="_blank"
+              rel="noopener"
+              >Learn</a
+            >
+          </li>
+          <li>
+            <a href="https://www.rpsgame.org/" target="_blank" rel="noopener"
+              >Play Online</a
+            >
+          </li>
+          <li>
+            <a href="https://umd.edu/" target="_blank" rel="noopener">UMD</a>
+          </li>
+        </ul>
+      </nav>
+    </header>
+    <main class="page">
+      <section class="main-content">
+      <h2>Enter the Arena</h2>
+      <p>Fill out the form below to choose your move.</p>
+
+      <form class="rps-form" action="#" method="post">
+        <div class="form-row">
+          <label for="playerName">Name:</label>
+          <input
+            type="text"
+            id="playerName"
+            name="playerName"
+            placeholder="Your name"
+            required
+          />
+        </div>
+        <div class="form-row">
+          <label for="move">Choose:</label>
+          <select id="move" name="move">
+            <option value="rock">Rock</option>
+            <option value="paper">Paper</option>
+            <option value="scissors">Scissors</option>
+          </select>
+        </div>
+        <button type="submit">Submit</button>
+      </form>
+    </section>
+
+     <aside class="sidebar">
+      <h2>Rules</h2>
+      <ul>
+        <li>Rock beats Scissors</li>
+        <li>Scissors beats Paper</li>
+        <li>Paper beats Rock</li>
+        <li>If both choose the same move, it's a tie</li>
+      </ul>
+    </aside>
+  </main>
+
+   <footer class="site-bar">
+    <p>just a boring footer</p>
+  </footer>
+    </main>
+  </body>
+</html>
